@@ -1,0 +1,17 @@
+{
+  "name": "telegram-claude-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot powered by Claude AI",
+  "main": "bot.cjs",
+  "scripts": {
+    "start": "node bot.cjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
+    "express": "^4.19.0",
+    "telegraf": "^4.16.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
