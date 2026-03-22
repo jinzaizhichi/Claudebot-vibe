@@ -1,13 +1,14 @@
 {
   "name": "telegram-claude-bot",
-  "version": "1.0.0",
-  "description": "Telegram bot powered by Claude AI",
+  "version": "2.0.0",
+  "description": "Telegram bot powered by Claude AI - with memory, web search and image recognition",
   "main": "bot.cjs",
   "scripts": {
     "start": "node bot.cjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.30.0",
+    "@supabase/supabase-js": "^2.39.0",
     "express": "^4.19.0",
     "telegraf": "^4.16.3"
   },
