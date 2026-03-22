@@ -1,7 +1,7 @@
 {
   "name": "telegram-claude-bot",
-  "version": "2.0.0",
-  "description": "Telegram bot powered by Claude AI - with memory, web search and image recognition",
+  "version": "3.0.0",
+  "description": "Personal AI assistant powered by Claude - 3-layer memory, web search, image recognition",
   "main": "bot.cjs",
   "scripts": {
     "start": "node bot.cjs"
