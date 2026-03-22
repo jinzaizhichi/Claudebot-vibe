@@ -17,9 +17,22 @@ if (!BOT_TOKEN || !ANTHROPIC_API_KEY) {
   process.exit(1);
 }
 
+
+// Debug logging
+console.log("=== ENV CHECK ===");
+console.log("SUPABASE_URL:", SUPABASE_URL ? SUPABASE_URL.substring(0, 30) + "..." : "NOT SET");
+console.log("SUPABASE_KEY:", SUPABASE_KEY ? SUPABASE_KEY.substring(0, 20) + "..." : "NOT SET");
+console.log("Supabase client:", SUPABASE_URL && SUPABASE_KEY ? "WILL INIT" : "SKIPPED - missing vars");
+console.log("================");
 const bot = new Telegraf(BOT_TOKEN);
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+if (supabase) {
+  supabase.from("user_docs").select("count", { count: "exact", head: true }).then(function(res) {
+    if (res.error) { console.error("Supabase TEST FAILED:", res.error.message); }
+    else { console.log("Supabase TEST OK - connected successfully"); }
+  }).catch(function(err) { console.error("Supabase ERROR:", err.message); });
+} else { console.log("Supabase NOT initialized - check SUPABASE_URL and SUPABASE_KEY"); }
 
 const memoryStore = new Map();
 const docsStore = new Map();
@@ -92,27 +105,49 @@ async function clearHistory(userId) {
 async function getDoc(userId, docType) {
   if (supabase) {
     try {
-      const { data } = await supabase
+      const uid = parseInt(userId);
+      console.log("getDoc querying - userId:", uid, "type:", typeof uid, "docType:", docType);
+      const { data, error, count } = await supabase
         .from("user_docs")
-        .select("content")
-        .eq("user_id", userId)
-        .eq("doc_type", docType)
-        .single();
-      return data ? data.content : null;
-    } catch (err) { return null; }
+        .select("content", { count: "exact" })
+        .eq("user_id", uid)
+        .eq("doc_type", docType);
+      console.log("getDoc raw result - error:", error ? error.message : "none", "data length:", data ? data.length : 0, "count:", count);
+      if (error) {
+        console.error("getDoc error:", docType, error.message);
+        return null;
+      }
+      if (data && data.length > 0) {
+        console.log("getDoc FOUND:", docType, data[0].content.substring(0, 50));
+        return data[0].content;
+      }
+      console.log("getDoc NOT FOUND:", docType);
+      return null;
+    } catch (err) {
+      console.error("getDoc exception:", err.message);
+      return null;
+    }
   }
   return docsStore.get(userId + "_" + docType) || null;
 }
 
 async function setDoc(userId, docType, content) {
+  console.log("setDoc called - userId:", userId, "docType:", docType);
   if (supabase) {
     try {
-      await supabase.from("user_docs").upsert(
-        { user_id: userId, doc_type: docType, content: content, updated_at: new Date().toISOString() },
+      const result = await supabase.from("user_docs").upsert(
+        { user_id: parseInt(userId), doc_type: docType, content: content, updated_at: new Date().toISOString() },
         { onConflict: "user_id,doc_type" }
       );
+      if (result.error) {
+        console.error("setDoc upsert error:", JSON.stringify(result.error));
+      } else {
+        console.log("setDoc SUCCESS - userId:", userId, "docType:", docType);
+      }
       return;
-    } catch (err) { console.error("setDoc error:", err.message); }
+    } catch (err) { console.error("setDoc exception:", err.message); }
+  } else {
+    console.log("setDoc - supabase not available, using memory");
   }
   docsStore.set(userId + "_" + docType, content);
 }
@@ -397,7 +432,7 @@ async function askClaude(userId, userMessage) {
     const searchResults = await tavilySearch(userMessage);
     if (searchResults) {
       // 把搜索结果加进 system prompt
-      const enhancedPrompt = systemPrompt + "=== WEB SEARCH RESULTS (use this for current info) ===\n" + searchResults + "\n\n";
+      const enhancedPrompt = systemPrompt + "=== WEB SEARCH RESULTS ===\nToday is 2026. IMPORTANT: Base your answer primarily on these search results, not your training data. If results show current info, use it.\n" + searchResults + "\n\n";
       const response = await anthropic.messages.create({
         model: "claude-opus-4-5",
         max_tokens: 4096,
