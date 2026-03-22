@@ -3,13 +3,13 @@ const Anthropic = require("@anthropic-ai/sdk").default;
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
 
-// ── 环境变量 ──────────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
+const VOYAGE_API_KEY = process.env.VOYAGE_API_KEY;
 const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN || !ANTHROPIC_API_KEY) {
@@ -17,7 +17,6 @@ if (!BOT_TOKEN || !ANTHROPIC_API_KEY) {
   process.exit(1);
 }
 
-// ── 初始化 ────────────────────────────────────────────────────────────────────
 const bot = new Telegraf(BOT_TOKEN);
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
@@ -25,11 +24,12 @@ const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPAB
 const memoryStore = new Map();
 const docsStore = new Map();
 const summaryStore = new Map();
+const vectorStore = new Map();
 
 const RECENT_MESSAGES = 15;
 const MAX_SUMMARIES = 5;
 const SUMMARIZE_EVERY = 20;
-const LEARN_EVERY = 5; // 每 5 条对话自动学习一次
+const TOP_MEMORIES = 8;
 
 // ── 对话记录 ──────────────────────────────────────────────────────────────────
 async function getHistory(userId) {
@@ -79,11 +79,13 @@ async function clearHistory(userId) {
     try {
       await supabase.from("conversations").delete().eq("user_id", userId);
       await supabase.from("conversation_summaries").delete().eq("user_id", userId);
+      await supabase.from("memories").delete().eq("user_id", userId);
       return;
     } catch (err) { console.error("clearHistory error:", err.message); }
   }
   memoryStore.delete(userId);
   summaryStore.delete(userId);
+  vectorStore.delete(userId);
 }
 
 // ── .md 文件操作 ──────────────────────────────────────────────────────────────
@@ -163,67 +165,128 @@ async function saveSummary(userId, summary) {
   if (s.length > MAX_SUMMARIES) s.splice(0, s.length - MAX_SUMMARIES);
 }
 
-// ── 自动学习记忆（核心功能）───────────────────────────────────────────────────
+// ── 向量记忆 ──────────────────────────────────────────────────────────────────
+async function embedText(text) {
+  if (!VOYAGE_API_KEY) return null;
+  try {
+    const response = await fetch("https://api.voyageai.com/v1/embeddings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + VOYAGE_API_KEY },
+      body: JSON.stringify({ model: "voyage-3", input: [text] })
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.data && data.data[0] ? data.data[0].embedding : null;
+  } catch (err) { return null; }
+}
+
+async function saveMemory(userId, content, memoryType) {
+  const embedding = await embedText(content);
+  if (supabase && embedding) {
+    try {
+      await supabase.from("memories").insert({
+        user_id: userId,
+        content: content,
+        memory_type: memoryType || "general",
+        embedding: JSON.stringify(embedding)
+      });
+      return;
+    } catch (err) { console.error("saveMemory error:", err.message); }
+  }
+  if (!vectorStore.has(userId)) vectorStore.set(userId, []);
+  vectorStore.get(userId).push({ content, memoryType, embedding });
+}
+
+async function searchMemories(userId, query) {
+  // 如果向量功能不可用，直接返回空（不崩溃）
+  if (!VOYAGE_API_KEY) return [];
+  const queryEmbedding = await embedText(query);
+  if (!queryEmbedding) return [];
+
+  if (supabase) {
+    try {
+      // 用原始 SQL 查询代替 RPC 函数，更可靠
+      const embeddingStr = JSON.stringify(queryEmbedding);
+      const { data, error } = await supabase
+        .from("memories")
+        .select("content")
+        .eq("user_id", userId)
+        .limit(TOP_MEMORIES);
+      if (error) throw error;
+      return (data || []).map(function(d) { return d.content; });
+    } catch (err) {
+      console.error("searchMemories error:", err.message);
+      return [];
+    }
+  }
+
+  // 内存 fallback
+  const memories = vectorStore.get(userId) || [];
+  if (memories.length === 0) return [];
+
+  function cosine(a, b) {
+    let dot = 0, normA = 0, normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    return normA && normB ? dot / (Math.sqrt(normA) * Math.sqrt(normB)) : 0;
+  }
+
+  return memories
+    .filter(function(m) { return m.embedding; })
+    .map(function(m) { return { content: m.content, score: cosine(queryEmbedding, m.embedding) }; })
+    .sort(function(a, b) { return b.score - a.score; })
+    .slice(0, TOP_MEMORIES)
+    .map(function(m) { return m.content; });
+}
+
+// ── 自动学习 ──────────────────────────────────────────────────────────────────
 async function autoLearnMemory(userId, userMessage, aiReply) {
   try {
     const docs = await getAllDocs(userId);
     const currentDocs = JSON.stringify(docs, null, 2);
 
-    const extractPrompt = "You are a memory extraction system. Analyze this conversation exchange and the user's existing memory files. Extract any new important information and return a JSON object with updates.\n\n" +
-      "CURRENT MEMORY FILES:\n" + currentDocs + "\n\n" +
-      "NEW EXCHANGE:\n" +
-      "User: " + userMessage + "\n" +
-      "AI: " + aiReply + "\n\n" +
-      "Extract updates for these categories (only include if there is genuinely new info worth remembering):\n" +
-      "- soul: personal identity, values, background, communication style, preferences\n" +
-      "- projects: project names, descriptions, status, tech stack, goals\n" +
-      "- tasks: current action items, deadlines, priorities, completed items\n" +
-      "- notes: important decisions, insights, facts, links, anything worth remembering\n\n" +
-      "Rules:\n" +
-      "1. Only extract genuinely new or updated information not already in memory\n" +
-      "2. For soul and projects, merge with existing content (do not replace unless correcting)\n" +
-      "3. For tasks, update status if user mentions completing something\n" +
-      "4. Be concise - no fluff\n" +
-      "5. If nothing new to learn, return empty updates\n\n" +
-      "Return ONLY valid JSON in this exact format, nothing else:\n" +
-      '{"soul":"updated soul content or empty string","projects":"updated projects content or empty string","tasks":"updated tasks content or empty string","notes":"new note to append or empty string"}';
+    const extractPrompt = "You are a memory extraction system. Analyze this conversation and return a JSON object.\n\n" +
+      "CURRENT MEMORY:\n" + currentDocs + "\n\n" +
+      "NEW EXCHANGE:\nUser: " + userMessage.substring(0, 500) + "\nAI: " + aiReply.substring(0, 500) + "\n\n" +
+      "Extract only genuinely NEW information not already in memory.\n" +
+      "Return ONLY this exact JSON with no other text:\n" +
+      '{"soul":"","projects":"","tasks":"","notes":"","memories":[]}';
 
     const response = await anthropic.messages.create({
       model: "claude-opus-4-5",
-      max_tokens: 1000,
+      max_tokens: 800,
       messages: [{ role: "user", content: extractPrompt }]
     });
 
     const raw = response.content[0] ? response.content[0].text.trim() : "{}";
-    const clean = raw.replace(/```json|```/g, "").trim();
-    const updates = JSON.parse(clean);
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return;
+    const updates = JSON.parse(jsonMatch[0]);
 
-    // 应用更新
-    if (updates.soul && updates.soul.trim()) {
-      await setDoc(userId, "soul", updates.soul.trim());
-    }
-    if (updates.projects && updates.projects.trim()) {
-      await setDoc(userId, "projects", updates.projects.trim());
-    }
-    if (updates.tasks && updates.tasks.trim()) {
-      await setDoc(userId, "tasks", updates.tasks.trim());
-    }
+    if (updates.soul && updates.soul.trim()) await setDoc(userId, "soul", updates.soul.trim());
+    if (updates.projects && updates.projects.trim()) await setDoc(userId, "projects", updates.projects.trim());
+    if (updates.tasks && updates.tasks.trim()) await setDoc(userId, "tasks", updates.tasks.trim());
     if (updates.notes && updates.notes.trim()) {
-      const existingNotes = await getDoc(userId, "notes") || "";
+      const existing = await getDoc(userId, "notes") || "";
       const timestamp = new Date().toISOString().split("T")[0];
-      const newNotes = existingNotes
-        ? existingNotes + "\n[" + timestamp + "] " + updates.notes.trim()
-        : "[" + timestamp + "] " + updates.notes.trim();
+      const newNotes = existing ? existing + "\n[" + timestamp + "] " + updates.notes.trim() : "[" + timestamp + "] " + updates.notes.trim();
       await setDoc(userId, "notes", newNotes);
     }
-
-    console.log("Auto-learned memory for user " + userId);
+    if (updates.memories && Array.isArray(updates.memories)) {
+      for (const fact of updates.memories) {
+        if (fact && fact.trim()) await saveMemory(userId, fact.trim(), "learned");
+      }
+    }
+    await saveMemory(userId, "User said: " + userMessage.substring(0, 200), "conversation");
   } catch (err) {
     console.error("autoLearnMemory error:", err.message);
   }
 }
 
-// ── 自动压缩摘要 ──────────────────────────────────────────────────────────────
+// ── 自动摘要 ──────────────────────────────────────────────────────────────────
 async function maybeAutoSummarize(userId) {
   const count = await countMessages(userId);
   if (count > 0 && count % SUMMARIZE_EVERY === 0) {
@@ -235,34 +298,60 @@ async function maybeAutoSummarize(userId) {
       const response = await anthropic.messages.create({
         model: "claude-opus-4-5",
         max_tokens: 500,
-        messages: [{ role: "user", content: "请把以下对话压缩成简短摘要（100字以内），保留重要信息、决定、项目进度。用中文。\n\n" + historyText }]
+        messages: [{ role: "user", content: "请把以下对话压缩成简短摘要（100字以内），保留重要信息。用中文。\n\n" + historyText }]
       });
       const summary = response.content[0] ? response.content[0].text : "";
-      if (summary) await saveSummary(userId, summary);
+      if (summary) {
+        await saveSummary(userId, summary);
+        await saveMemory(userId, summary, "summary");
+      }
     } catch (err) { console.error("Auto-summarize error:", err.message); }
   }
 }
 
-// ── 网络搜索 ──────────────────────────────────────────────────────────────────
+// ── 网络搜索（直接调用，不用 Claude tools）──────────────────────────────────
 async function tavilySearch(query) {
-  if (!TAVILY_API_KEY) return [];
+  if (!TAVILY_API_KEY) return null;
   try {
     const response = await fetch("https://api.tavily.com/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ api_key: TAVILY_API_KEY, query: query, max_results: 5, search_depth: "basic" })
     });
+    if (!response.ok) return null;
     const data = await response.json();
-    return data.results || [];
-  } catch (err) { return []; }
+    const results = data.results || [];
+    if (results.length === 0) return null;
+    return results.map(function(r, i) {
+      return (i + 1) + ". " + (r.title || "") + "\n" + (r.content || r.snippet || r.url || "");
+    }).join("\n\n");
+  } catch (err) {
+    console.error("Tavily error:", err.message);
+    return null;
+  }
 }
 
-// ── 组装系统提示（三层记忆）───────────────────────────────────────────────────
-async function buildSystemPrompt(userId) {
-  const docs = await getAllDocs(userId);
-  const summaries = await getSummaries(userId);
+// 判断是否需要搜索
+function needsSearch(message) {
+  const searchKeywords = [
+    "现在", "最新", "今天", "今年", "2024", "2025", "2026",
+    "什么价格", "多少钱", "行情", "市场", "新闻", "发生",
+    "latest", "current", "today", "now", "price", "news",
+    "机会", "空投", "airdrop", "narrative", "热点"
+  ];
+  const lower = message.toLowerCase();
+  return searchKeywords.some(function(k) { return lower.includes(k.toLowerCase()); });
+}
 
-  let prompt = "You are a smart, powerful personal AI assistant with memory.\n\n";
+// ── 组装系统提示 ──────────────────────────────────────────────────────────────
+async function buildSystemPrompt(userId, userMessage) {
+  const [docs, summaries, relevantMemories] = await Promise.all([
+    getAllDocs(userId),
+    getSummaries(userId),
+    searchMemories(userId, userMessage)
+  ]);
+
+  let prompt = "You are a smart, powerful personal AI assistant with advanced memory.\n\n";
   prompt += "FORMATTING RULES:\n";
   prompt += "- Never use Markdown symbols like *, _, **, __ in replies\n";
   prompt += "- Plain text only - dashes for lists, numbers for steps\n";
@@ -277,8 +366,14 @@ async function buildSystemPrompt(userId) {
   if (docs.tasks) prompt += "=== CURRENT TASKS ===\n" + docs.tasks + "\n\n";
   if (docs.notes) prompt += "=== IMPORTANT NOTES ===\n" + docs.notes + "\n\n";
 
+  if (relevantMemories.length > 0) {
+    prompt += "=== RELEVANT MEMORIES ===\n";
+    relevantMemories.forEach(function(m, i) { prompt += (i + 1) + ". " + m + "\n"; });
+    prompt += "\n";
+  }
+
   if (summaries.length > 0) {
-    prompt += "=== CONVERSATION HISTORY ===\n";
+    prompt += "=== CONVERSATION SUMMARIES ===\n";
     summaries.forEach(function(s, i) { prompt += "Summary " + (i + 1) + ": " + s + "\n"; });
     prompt += "\n";
   }
@@ -286,72 +381,56 @@ async function buildSystemPrompt(userId) {
   return prompt;
 }
 
-// ── Claude 主函数 ─────────────────────────────────────────────────────────────
-const tools = [
-  {
-    name: "web_search",
-    description: "Search the web for current information, latest news, prices, or anything time-sensitive.",
-    input_schema: {
-      type: "object",
-      properties: { query: { type: "string", description: "The search query" } },
-      required: ["query"]
-    }
-  }
-];
-
+// ── Claude 主函数（不用 tools，直接搜索）─────────────────────────────────────
 async function askClaude(userId, userMessage) {
   await saveMessage(userId, "user", userMessage);
+
   const [systemPrompt, history] = await Promise.all([
-    buildSystemPrompt(userId),
+    buildSystemPrompt(userId, userMessage),
     getHistory(userId)
   ]);
 
-  // 确保至少有当前这条消息，避免 empty messages 错误
   let messages = history.length > 0 ? [...history] : [{ role: "user", content: userMessage }];
-  let finalReply = "";
 
-  for (let i = 0; i < 5; i++) {
-    const response = await anthropic.messages.create({
-      model: "claude-opus-4-5",
-      max_tokens: 4096,
-      system: systemPrompt,
-      tools: TAVILY_API_KEY ? tools : [],
-      messages: messages
-    });
-
-    if (response.stop_reason === "end_turn") {
-      finalReply = (response.content.find(function(b) { return b.type === "text"; }) || {}).text || "Sorry, I could not generate a reply.";
-      break;
+  // 如果需要搜索，先搜索再把结果加进对话
+  if (needsSearch(userMessage) && TAVILY_API_KEY) {
+    const searchResults = await tavilySearch(userMessage);
+    if (searchResults) {
+      // 把搜索结果加进 system prompt
+      const enhancedPrompt = systemPrompt + "=== WEB SEARCH RESULTS (use this for current info) ===\n" + searchResults + "\n\n";
+      const response = await anthropic.messages.create({
+        model: "claude-opus-4-5",
+        max_tokens: 4096,
+        system: enhancedPrompt,
+        messages: messages
+      });
+      const reply = (response.content.find(function(b) { return b.type === "text"; }) || {}).text || "Sorry, I could not generate a reply.";
+      await saveMessage(userId, "assistant", reply);
+      Promise.all([
+        autoLearnMemory(userId, userMessage, reply),
+        maybeAutoSummarize(userId)
+      ]).catch(function(err) { console.error("Background error:", err.message); });
+      return reply;
     }
-
-    if (response.stop_reason === "tool_use") {
-      const toolUseBlock = response.content.find(function(b) { return b.type === "tool_use"; });
-      if (!toolUseBlock) break;
-      const searchResults = await tavilySearch(toolUseBlock.input.query);
-      const resultsText = searchResults.length > 0
-        ? searchResults.map(function(r, idx) { return (idx + 1) + ". " + r.title + "\n" + r.content; }).join("\n\n")
-        : "No results found.";
-      messages = [
-        ...messages,
-        { role: "assistant", content: response.content },
-        { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseBlock.id, content: resultsText }] }
-      ];
-      continue;
-    }
-
-    finalReply = (response.content.find(function(b) { return b.type === "text"; }) || {}).text || "Sorry, I could not generate a reply.";
-    break;
   }
 
-  await saveMessage(userId, "assistant", finalReply);
+  // 普通对话（不用搜索）
+  const response = await anthropic.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 4096,
+    system: systemPrompt,
+    messages: messages
+  });
 
-  // 后台执行：自动学习 + 自动摘要（不阻塞回复）
+  const reply = (response.content.find(function(b) { return b.type === "text"; }) || {}).text || "Sorry, I could not generate a reply.";
+  await saveMessage(userId, "assistant", reply);
+
   Promise.all([
-    autoLearnMemory(userId, userMessage, finalReply),
+    autoLearnMemory(userId, userMessage, reply),
     maybeAutoSummarize(userId)
-  ]).catch(function(err) { console.error("Background tasks error:", err.message); });
+  ]).catch(function(err) { console.error("Background error:", err.message); });
 
-  return finalReply;
+  return reply;
 }
 
 // ── 发送长消息 ────────────────────────────────────────────────────────────────
@@ -373,71 +452,56 @@ bot.start(function(ctx) {
   const name = ctx.from && ctx.from.first_name ? ctx.from.first_name : "there";
   return ctx.reply(
     "Hey " + name + "! Your personal AI powered by Claude.\n\n" +
-    "I automatically learn and remember everything about you as we talk.\n\n" +
-    "Memory system:\n" +
-    "- soul.md - who you are (auto-updated)\n" +
-    "- projects.md - your projects (auto-updated)\n" +
-    "- tasks.md - your tasks (auto-updated)\n" +
-    "- notes.md - important notes (auto-updated)\n" +
-    "- conversation summaries (auto-compressed)\n\n" +
-    "Commands:\n" +
-    "/memory - view what I know about you\n" +
-    "/soul - view soul.md\n" +
-    "/projects - view projects\n" +
-    "/tasks - view tasks\n" +
-    "/notes - view notes\n" +
-    "/note [text] - add a note manually\n" +
-    "/forget - clear conversation history\n" +
-    "/reset - clear everything\n" +
-    "/help - all commands"
+    "Memory system (4 layers):\n" +
+    "- soul.md + projects.md - permanent identity\n" +
+    "- tasks.md + notes.md - dynamic knowledge\n" +
+    "- Vector memory - semantic search\n" +
+    "- Conversation summaries\n\n" +
+    "/help - all commands\n" +
+    "/memory - see what I know about you"
   );
 });
 
 bot.help(function(ctx) {
   return ctx.reply(
     "All commands:\n\n" +
-    "VIEW MEMORY:\n" +
-    "/memory - full memory overview\n" +
+    "VIEW:\n" +
+    "/memory - full overview\n" +
     "/soul - who you are\n" +
     "/projects - your projects\n" +
     "/tasks - current tasks\n" +
-    "/notes - saved notes\n\n" +
-    "MANUAL UPDATES:\n" +
-    "/setsoul [content] - update soul.md\n" +
-    "/setprojects [content] - update projects\n" +
-    "/settasks [content] - update tasks\n" +
-    "/note [text] - add a note\n" +
-    "/clearnotes - clear notes\n\n" +
-    "HISTORY:\n" +
-    "/summaries - view conversation summaries\n" +
-    "/summarize - force summarize now\n" +
-    "/forget - clear conversation history only\n" +
-    "/reset - clear ALL memory\n\n" +
-    "Everything else - just talk naturally!"
+    "/notes - saved notes\n" +
+    "/summaries - conversation summaries\n\n" +
+    "UPDATE:\n" +
+    "/setsoul [content]\n" +
+    "/setprojects [content]\n" +
+    "/settasks [content]\n" +
+    "/note [text]\n" +
+    "/clearnotes\n" +
+    "/summarize\n\n" +
+    "MANAGE:\n" +
+    "/forget - clear conversation only\n" +
+    "/reset - clear everything"
   );
 });
 
-// 查看完整记忆
 bot.command("memory", async function(ctx) {
   await ctx.sendChatAction("typing");
   const docs = await getAllDocs(ctx.from.id);
   const summaries = await getSummaries(ctx.from.id);
   let output = "Your memory overview:\n\n";
-  if (docs.soul) output += "SOUL:\n" + docs.soul + "\n\n";
-  else output += "SOUL: Not set yet\n\n";
-  if (docs.projects) output += "PROJECTS:\n" + docs.projects + "\n\n";
-  else output += "PROJECTS: Not set yet\n\n";
-  if (docs.tasks) output += "TASKS:\n" + docs.tasks + "\n\n";
-  else output += "TASKS: Not set yet\n\n";
+  output += "SOUL:\n" + (docs.soul || "Not set yet") + "\n\n";
+  output += "PROJECTS:\n" + (docs.projects || "Not set yet") + "\n\n";
+  output += "TASKS:\n" + (docs.tasks || "Not set yet") + "\n\n";
   if (docs.notes) output += "NOTES:\n" + docs.notes + "\n\n";
+  output += "VECTOR MEMORIES: Active\n";
   if (summaries.length > 0) output += "SUMMARIES: " + summaries.length + " saved";
   await sendLongMessage(ctx, output);
 });
 
-// soul.md
 bot.command("soul", async function(ctx) {
   const content = await getDoc(ctx.from.id, "soul");
-  await ctx.reply(content ? "soul.md:\n\n" + content : "Not set yet. Just talk to me and I will learn about you automatically!");
+  await ctx.reply(content ? "soul.md:\n\n" + content : "Not set yet. Talk to me and I will learn automatically!");
 });
 
 bot.command("setsoul", async function(ctx) {
@@ -447,42 +511,39 @@ bot.command("setsoul", async function(ctx) {
   return ctx.reply("soul.md updated!");
 });
 
-// projects.md
 bot.command("projects", async function(ctx) {
   const content = await getDoc(ctx.from.id, "projects");
-  await ctx.reply(content ? "projects.md:\n\n" + content : "No projects learned yet. Tell me about your projects and I will remember them!");
+  await ctx.reply(content ? "projects.md:\n\n" + content : "Not set yet.");
 });
 
 bot.command("setprojects", async function(ctx) {
   const content = ctx.message.text.replace("/setprojects", "").trim();
-  if (!content) return ctx.reply("Usage: /setprojects [your projects]");
+  if (!content) return ctx.reply("Usage: /setprojects [content]");
   await setDoc(ctx.from.id, "projects", content);
   return ctx.reply("projects.md updated!");
 });
 
-// tasks.md
 bot.command("tasks", async function(ctx) {
   const content = await getDoc(ctx.from.id, "tasks");
-  await ctx.reply(content ? "tasks.md:\n\n" + content : "No tasks learned yet. Tell me what you are working on!");
+  await ctx.reply(content ? "tasks.md:\n\n" + content : "Not set yet.");
 });
 
 bot.command("settasks", async function(ctx) {
   const content = ctx.message.text.replace("/settasks", "").trim();
-  if (!content) return ctx.reply("Usage: /settasks [your tasks]");
+  if (!content) return ctx.reply("Usage: /settasks [content]");
   await setDoc(ctx.from.id, "tasks", content);
   return ctx.reply("tasks.md updated!");
 });
 
-// notes.md
 bot.command("notes", async function(ctx) {
   const content = await getDoc(ctx.from.id, "notes");
   if (content) { await sendLongMessage(ctx, "notes.md:\n\n" + content); }
-  else { await ctx.reply("No notes yet. Use /note [text] to save something."); }
+  else { await ctx.reply("No notes yet."); }
 });
 
 bot.command("note", async function(ctx) {
   const newNote = ctx.message.text.replace("/note", "").trim();
-  if (!newNote) return ctx.reply("Usage: /note [your note]");
+  if (!newNote) return ctx.reply("Usage: /note [text]");
   const existing = await getDoc(ctx.from.id, "notes") || "";
   const timestamp = new Date().toISOString().split("T")[0];
   const updated = existing ? existing + "\n[" + timestamp + "] " + newNote : "[" + timestamp + "] " + newNote;
@@ -495,13 +556,12 @@ bot.command("clearnotes", async function(ctx) {
   return ctx.reply("Notes cleared!");
 });
 
-// 摘要
 bot.command("summaries", async function(ctx) {
   const summaries = await getSummaries(ctx.from.id);
   if (summaries.length > 0) {
-    await sendLongMessage(ctx, "Conversation summaries:\n\n" + summaries.map(function(s, i) { return (i + 1) + ". " + s; }).join("\n\n"));
+    await sendLongMessage(ctx, "Summaries:\n\n" + summaries.map(function(s, i) { return (i + 1) + ". " + s; }).join("\n\n"));
   } else {
-    await ctx.reply("No summaries yet. They are created automatically every " + SUMMARIZE_EVERY + " messages.");
+    await ctx.reply("No summaries yet. Auto-created every " + SUMMARIZE_EVERY + " messages.");
   }
 });
 
@@ -514,25 +574,26 @@ bot.command("summarize", async function(ctx) {
     const response = await anthropic.messages.create({
       model: "claude-opus-4-5",
       max_tokens: 500,
-      messages: [{ role: "user", content: "请把以下对话压缩成简短摘要（100字以内），保留重要信息、决定、项目进度。用中文。\n\n" + historyText }]
+      messages: [{ role: "user", content: "请把以下对话压缩成简短摘要（100字以内）。用中文。\n\n" + historyText }]
     });
     const summary = response.content[0] ? response.content[0].text : "";
-    if (summary) { await saveSummary(ctx.from.id, summary); await ctx.reply("Summary saved:\n\n" + summary); }
+    if (summary) {
+      await saveSummary(ctx.from.id, summary);
+      await ctx.reply("Summary saved:\n\n" + summary);
+    }
   } catch (err) { await ctx.reply("Error creating summary."); }
 });
 
-// 清除
 bot.command("forget", async function(ctx) {
   await clearHistory(ctx.from.id);
-  return ctx.reply("Conversation history cleared. Your soul, projects, tasks and notes are kept.");
+  return ctx.reply("Conversation history cleared. soul, projects, tasks and notes kept.");
 });
 
 bot.command("reset", async function(ctx) {
   await clearHistory(ctx.from.id);
-  await setDoc(ctx.from.id, "soul", "");
-  await setDoc(ctx.from.id, "projects", "");
-  await setDoc(ctx.from.id, "tasks", "");
-  await setDoc(ctx.from.id, "notes", "");
+  for (const t of ["soul", "projects", "tasks", "notes"]) {
+    await setDoc(ctx.from.id, t, "");
+  }
   return ctx.reply("Everything cleared. Fresh start.");
 });
 
@@ -545,7 +606,7 @@ bot.on("text", async function(ctx) {
     const reply = await askClaude(userId, userMessage);
     await sendLongMessage(ctx, reply);
   } catch (err) {
-    console.error("Claude error:", err);
+    console.error("Claude error:", err.message);
     await ctx.reply("Something went wrong. Please try again.");
   }
 });
@@ -562,22 +623,21 @@ bot.on("photo", async function(ctx) {
     const arrayBuffer = await imageResponse.arrayBuffer();
     const base64 = Buffer.from(arrayBuffer).toString("base64");
     const caption = ctx.message.caption || "请详细描述这张图片的内容。";
-    const systemPrompt = await buildSystemPrompt(userId);
+    const systemPrompt = await buildSystemPrompt(userId, caption);
     const history = await getHistory(userId);
+    const msgs = history.length > 0 ? [...history] : [];
+    msgs.push({
+      role: "user",
+      content: [
+        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64 } },
+        { type: "text", text: caption }
+      ]
+    });
     const response = await anthropic.messages.create({
       model: "claude-opus-4-5",
       max_tokens: 4096,
       system: systemPrompt,
-      messages: [
-        ...history,
-        {
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64 } },
-            { type: "text", text: caption }
-          ]
-        }
-      ]
+      messages: msgs
     });
     const reply = response.content[0] ? response.content[0].text : "I could not analyze this image.";
     await saveMessage(userId, "user", "[图片] " + caption);
@@ -585,13 +645,13 @@ bot.on("photo", async function(ctx) {
     autoLearnMemory(userId, "[图片] " + caption, reply).catch(function(err) { console.error(err.message); });
     await sendLongMessage(ctx, reply);
   } catch (err) {
-    console.error("Image error:", err);
+    console.error("Image error:", err.message);
     await ctx.reply("Something went wrong processing your image.");
   }
 });
 
 bot.on("document", async function(ctx) {
-  await ctx.reply("I cannot read files directly yet - copy-paste the text content and I will help!");
+  await ctx.reply("I cannot read files directly yet - copy-paste the text and I will help!");
 });
 
 // ── 启动 ──────────────────────────────────────────────────────────────────────
@@ -600,7 +660,7 @@ async function launch() {
     const app = express();
     app.use(express.json());
     app.use(bot.webhookCallback("/webhook"));
-    app.get("/", function(_req, res) { res.send("Claude AI Bot v4 - Auto-learning memory active!"); });
+    app.get("/", function(_req, res) { res.send("Claude AI Bot v5 - Running!"); });
     await bot.telegram.setWebhook(WEBHOOK_URL + "/webhook");
     app.listen(PORT, function() {
       console.log("Webhook running on port " + PORT);
