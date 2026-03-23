@@ -8,9 +8,11 @@ Built by [@0xKingsKuan](https://x.com/0xKingsKuan)
 
 ## 一键部署
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/github/kingskuan/Claudebot-vibe)
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.com/deploy/hi0iqD?referralCode=ztkI8u)
 
-点击按钮 → 填入变量 → 自动部署完成 🚀
+点击按钮 → 填入你的变量 → 部署完成 🚀
+
+需要准备的变量见下方表格。
 
 -----
 
