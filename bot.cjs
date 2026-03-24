@@ -38,6 +38,19 @@ const memoryStore = new Map();
 const docsStore = new Map();
 const summaryStore = new Map();
 const vectorStore = new Map();
+const processingLock = new Map(); // prevent concurrent processing per user
+
+async function withLock(userId, fn) {
+  if (processingLock.get(userId)) {
+    return null; // skip if already processing
+  }
+  processingLock.set(userId, true);
+  try {
+    return await fn();
+  } finally {
+    processingLock.delete(userId);
+  }
+}
 
 const RECENT_MESSAGES = 15;
 const MAX_SUMMARIES = 5;
@@ -291,7 +304,7 @@ async function autoLearnMemory(userId, userMessage, aiReply) {
       '{"soul":"","projects":"","tasks":"","notes":"","memories":[]}';
 
     const response = await anthropic.messages.create({
-      model: "claude-opus-4-5",
+      model: "claude-haiku-4-5-20251001",
       max_tokens: 800,
       messages: [{ role: "user", content: extractPrompt }]
     });
@@ -312,7 +325,7 @@ async function autoLearnMemory(userId, userMessage, aiReply) {
     }
     if (updates.memories && Array.isArray(updates.memories)) {
       for (const fact of updates.memories) {
-        if (fact && fact.trim()) await saveMemory(userId, fact.trim(), "learned");
+        if (fact && typeof fact === "string" && fact.trim()) await saveMemory(userId, fact.trim(), "learned");
       }
     }
     await saveMemory(userId, "User said: " + userMessage.substring(0, 200), "conversation");
@@ -366,16 +379,24 @@ async function tavilySearch(query) {
   }
 }
 
-// 判断是否需要搜索
-function needsSearch(message) {
-  const searchKeywords = [
-    "现在", "最新", "今天", "今年", "2024", "2025", "2026",
-    "什么价格", "多少钱", "行情", "市场", "新闻", "发生",
-    "latest", "current", "today", "now", "price", "news",
-    "机会", "空投", "airdrop", "narrative", "热点"
-  ];
-  const lower = message.toLowerCase();
-  return searchKeywords.some(function(k) { return lower.includes(k.toLowerCase()); });
+// 用 Claude 智能判断是否需要搜索
+async function needsSearch(message) {
+  if (!TAVILY_API_KEY) return false;
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 10,
+      messages: [{
+        role: "user",
+        content: "Does this question require real-time or current information to answer accurately? Answer only YES or NO.\n\nQuestion: " + message
+      }]
+    });
+    const answer = response.content[0] ? response.content[0].text.trim().toUpperCase() : "NO";
+    console.log("needsSearch:", answer, "for:", message.substring(0, 50));
+    return answer.includes("YES");
+  } catch (err) {
+    return false;
+  }
 }
 
 // ── 组装系统提示 ──────────────────────────────────────────────────────────────
@@ -428,7 +449,7 @@ async function askClaude(userId, userMessage) {
   let messages = history.length > 0 ? [...history] : [{ role: "user", content: userMessage }];
 
   // 如果需要搜索，先搜索再把结果加进对话
-  if (needsSearch(userMessage) && TAVILY_API_KEY) {
+  if ((await needsSearch(userMessage)) && TAVILY_API_KEY) {
     const searchResults = await tavilySearch(userMessage);
     if (searchResults) {
       // 把搜索结果加进 system prompt
@@ -441,10 +462,11 @@ async function askClaude(userId, userMessage) {
       });
       const reply = (response.content.find(function(b) { return b.type === "text"; }) || {}).text || "Sorry, I could not generate a reply.";
       await saveMessage(userId, "assistant", reply);
-      Promise.all([
-        autoLearnMemory(userId, userMessage, reply),
-        maybeAutoSummarize(userId)
-      ]).catch(function(err) { console.error("Background error:", err.message); });
+      countMessages(userId).then(function(count) {
+        const tasks = [maybeAutoSummarize(userId)];
+        if (count % 5 === 0) tasks.push(autoLearnMemory(userId, userMessage, reply));
+        return Promise.all(tasks);
+      }).catch(function(err) { console.error("Background error:", err.message); });
       return reply;
     }
   }
@@ -460,10 +482,11 @@ async function askClaude(userId, userMessage) {
   const reply = (response.content.find(function(b) { return b.type === "text"; }) || {}).text || "Sorry, I could not generate a reply.";
   await saveMessage(userId, "assistant", reply);
 
-  Promise.all([
-    autoLearnMemory(userId, userMessage, reply),
-    maybeAutoSummarize(userId)
-  ]).catch(function(err) { console.error("Background error:", err.message); });
+  countMessages(userId).then(function(count) {
+    const tasks = [maybeAutoSummarize(userId)];
+    if (count % 5 === 0) tasks.push(autoLearnMemory(userId, userMessage, reply));
+    return Promise.all(tasks);
+  }).catch(function(err) { console.error("Background error:", err.message); });
 
   return reply;
 }
@@ -636,10 +659,21 @@ bot.command("reset", async function(ctx) {
 bot.on("text", async function(ctx) {
   const userId = ctx.from.id;
   const userMessage = ctx.message.text;
+
+  // Skip if message is too long (likely raw data dump)
+  if (userMessage.length > 3000) {
+    return ctx.reply("消息太长了！请把内容分成小段发送，或者总结后再发给我。");
+  }
+
   await ctx.sendChatAction("typing");
   try {
-    const reply = await askClaude(userId, userMessage);
-    await sendLongMessage(ctx, reply);
+    const result = await withLock(userId, async function() {
+      return await askClaude(userId, userMessage);
+    });
+    if (result) {
+      await sendLongMessage(ctx, result);
+    }
+    // if null, silently drop duplicate request
   } catch (err) {
     console.error("Claude error:", err.message);
     await ctx.reply("Something went wrong. Please try again.");
