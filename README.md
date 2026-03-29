@@ -4,7 +4,7 @@ A personal AI assistant powered by Claude, running on Telegram. Features a 4-lay
 
 Built by [@0xKingsKuan](https://x.com/0xKingsKuan)
 
-一个接入 Claude AI 的 Telegram 私人助理。带四层记忆系统、自动学习、网络搜索、图片识别和全自动赏金 Pipeline。越用越聪明，重启不丢失记忆。
+一个接入 Claude AI 的 Telegram 私人助理。带四层记忆系统、自动学习、网络搜索、图片识别和全自动 vibe 部署。越用越聪明，重启不丢失记忆。
 
 -----
 
