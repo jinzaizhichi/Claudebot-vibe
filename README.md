@@ -1,10 +1,10 @@
 # Claude 大神 Telegram Bot
 
-A personal AI assistant powered by Claude, running on Telegram. Features a 4-layer memory system, auto-learning, web search, image recognition, and a full bounty automation pipeline. Gets smarter the more you use it — memory persists across restarts.
+A personal AI assistant powered by Claude, running on Telegram. Features a 4-layer memory system, auto-learning, web search and image recognition. Gets smarter the more you use it — memory persists across restarts.
 
 Built by [@0xKingsKuan](https://x.com/0xKingsKuan)
 
-一个接入 Claude AI 的 Telegram 私人助理。带四层记忆系统、自动学习、网络搜索、图片识别和全自动 vibe 部署。越用越聪明，重启不丢失记忆。
+一个接入 Claude AI 的 Telegram 私人助理。带四层记忆系统、自动学习、网络搜索和图片识别。越用越聪明，重启不丢失记忆。
 
 -----
 
@@ -214,6 +214,24 @@ Recommended first steps:
 - `/vibe` — Start AI-assisted project builder (generates code + pushes to GitHub)
 - `/vibestop` — Exit Vibe Coding mode
 - `/deploy [GitHub link]` — Auto-deploy to Railway (can include env vars)
+- `/code [description]` — Generate a complete code file in any language (2-pass, no truncation)
+- `/codestop` — Exit Code mode
+- `/fix [instructions]` — Modify an existing code file (send instructions then upload file)
+- `/save [version]` — Save the last generated code as a named version
+- `/versions` — List all saved code versions
+- `/load [version]` — Retrieve a saved code version
+
+-----
+
+- `/vibe` — 启动 AI 辅助建项目（生成代码 + 推送 GitHub）
+- `/vibestop` — 退出 Vibe Coding 模式
+- `/deploy [GitHub链接]` — 自动部署到 Railway
+- `/code [描述]` — 生成完整代码文件（任何语言，两段合并不截断）
+- `/codestop` — 退出 Code 模式
+- `/fix [说明]` — 修改现有代码文件（先说要改什么，再发文件）
+- `/save [版本名]` — 保存最近生成的代码
+- `/versions` — 查看所有保存的版本
+- `/load [版本名]` — 加载已保存的代码版本
 
 **Analytics / 分析**
 
