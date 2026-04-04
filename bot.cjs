@@ -45,6 +45,7 @@ const summaryStore = new Map();
 const vectorStore = new Map();
 const processingLock = new Map(); // prevent concurrent processing per user
 const mediaGroupCache = new Map(); // cache files from same media group
+const streamedReplies = new Set(); // track replies already shown via streaming
 const MEDIA_GROUP_WAIT_MS = 1500; // wait 1.5s to collect all files in group
 const docsCache = new Map(); // cache docs for 60 seconds
 const CACHE_TTL = 60000;
@@ -784,8 +785,8 @@ async function askClaude(userId, userMessage, ctx) {
     return Promise.all(tasks);
   }).catch(function(err) { console.error("Background error:", err.message); });
 
-  // Mark that streaming already showed this - caller should not call sendLongMessage
-  if (reply) reply.__streamedAlready = true;
+  // Mark that streaming already handled display
+  if (reply) streamedReplies.add(reply);
   return reply;
 }
 
@@ -1413,6 +1414,334 @@ bot.command("reset", async function(ctx) {
   return ctx.reply("Everything cleared. Fresh start.");
 });
 
+// ── 新增功能命令 ──────────────────────────────────────────────────────────────
+
+// /translate - 翻译
+bot.command("translate", async function(ctx) {
+  const args = ctx.message.text.split(" ");
+  const lang = args[1] || "English";
+  const text = args.slice(2).join(" ");
+  if (!text) return ctx.reply("用法: /translate 英文 你想翻译的内容\n例如: /translate 英文 你好世界");
+  await ctx.sendChatAction("typing");
+  try {
+    const res = await anthropic.messages.create({
+      model: FAST_MODEL, max_tokens: 1000,
+      messages: [{ role: "user", content: "翻译成" + lang + "，只输出翻译结果，不要解释:\n\n" + text }]
+    });
+    await ctx.reply("🌐 " + ((res.content[0] || {}).text || ""));
+  } catch(e) { await ctx.reply("翻译失败: " + e.message); }
+});
+
+// /improve - 润色改写
+bot.command("improve", async function(ctx) {
+  const text = ctx.message.text.split(" ").slice(1).join(" ");
+  if (!text) return ctx.reply("用法: /improve 你要润色的文字");
+  await ctx.sendChatAction("typing");
+  try {
+    const res = await anthropic.messages.create({
+      model: MAIN_MODEL, max_tokens: 2000,
+      messages: [{ role: "user", content: "请润色改写以下文字，保持原意但更专业、流畅。同时提供两个版本：简洁版和详细版。\n\n" + text }]
+    });
+    await sendLongMessage(ctx, "✨ **润色结果**\n\n" + ((res.content[0] || {}).text || ""));
+  } catch(e) { await ctx.reply("润色失败: " + e.message); }
+});
+
+// /brainstorm - 头脑风暴
+bot.command("brainstorm", async function(ctx) {
+  const topic = ctx.message.text.split(" ").slice(1).join(" ");
+  if (!topic) return ctx.reply("用法: /brainstorm 你的话题或问题");
+  await ctx.sendChatAction("typing");
+  try {
+    const res = await anthropic.messages.create({
+      model: MAIN_MODEL, max_tokens: 2000,
+      messages: [{ role: "user", content: "对以下话题做结构化头脑风暴分析。用中文输出，格式：\n1. 核心概念分解\n2. 5个创意方向（每个附简短说明）\n3. 潜在风险/挑战\n4. 推荐下一步行动\n\n话题: " + topic }]
+    });
+    await sendLongMessage(ctx, "🧠 **头脑风暴: " + topic + "**\n\n" + ((res.content[0] || {}).text || ""));
+  } catch(e) { await ctx.reply("失败: " + e.message); }
+});
+
+// /explain - 解释代码
+bot.command("explain", async function(ctx) {
+  const code = ctx.message.text.split("\n").slice(1).join("\n") || ctx.message.text.split(" ").slice(1).join(" ");
+  if (!code.trim()) return ctx.reply("用法: 发 /explain 然后换行粘贴代码");
+  await ctx.sendChatAction("typing");
+  try {
+    const res = await anthropic.messages.create({
+      model: MAIN_MODEL, max_tokens: 2000,
+      messages: [{ role: "user", content: "用中文解释以下代码的逻辑和功能，不要修改，只解释：\n\n" + code }]
+    });
+    await sendLongMessage(ctx, "💡 **代码解释**\n\n" + ((res.content[0] || {}).text || ""));
+  } catch(e) { await ctx.reply("失败: " + e.message); }
+});
+
+// /review - 代码审查
+bot.command("review", async function(ctx) {
+  const code = ctx.message.text.split("\n").slice(1).join("\n") || ctx.message.text.split(" ").slice(1).join(" ");
+  if (!code.trim()) return ctx.reply("用法: 发 /review 然后换行粘贴代码");
+  await ctx.sendChatAction("typing");
+  try {
+    const res = await anthropic.messages.create({
+      model: MAIN_MODEL, max_tokens: 2000,
+      messages: [{ role: "user", content: "对以下代码做专业代码审查，用中文输出：\n1. 整体评分（1-10）\n2. 优点\n3. 问题/Bug\n4. 安全隐患\n5. 改进建议\n\n" + code }]
+    });
+    await sendLongMessage(ctx, "🔍 **代码审查**\n\n" + ((res.content[0] || {}).text || ""));
+  } catch(e) { await ctx.reply("失败: " + e.message); }
+});
+
+// /test - 生成测试用例
+bot.command("test", async function(ctx) {
+  const code = ctx.message.text.split("\n").slice(1).join("\n") || ctx.message.text.split(" ").slice(1).join(" ");
+  if (!code.trim()) return ctx.reply("用法: 发 /test 然后换行粘贴代码");
+  await ctx.sendChatAction("typing");
+  try {
+    const res = await anthropic.messages.create({
+      model: MAIN_MODEL, max_tokens: 3000,
+      messages: [{ role: "user", content: "为以下代码生成完整的测试用例（包括正常情况、边界情况、错误情况）。输出可直接运行的测试代码：\n\n" + code }]
+    });
+    const testCode = (res.content[0] || {}).text || "";
+    const buf = Buffer.from(testCode, "utf-8");
+    const ts = new Date().toISOString().slice(11,16).replace(":","");
+    await withRetry(function() {
+      return ctx.replyWithDocument({ source: buf, filename: "test_" + ts + ".js" }, { caption: "✅ 测试用例已生成" });
+    });
+  } catch(e) { await ctx.reply("失败: " + e.message); }
+});
+
+// /export - 导出聊天记录
+bot.command("export", async function(ctx) {
+  const userId = ctx.from.id;
+  await ctx.sendChatAction("upload_document");
+  try {
+    const history = await getHistory(userId);
+    const summaries = await getSummaries(userId);
+    let text = "=== Claude 大神 对话记录 ===\n";
+    text += "导出时间: " + new Date().toLocaleString("zh-CN") + "\n\n";
+    if (summaries.length > 0) {
+      text += "=== 对话摘要 ===\n";
+      summaries.forEach(function(s) { text += "- " + s.content + "\n"; });
+      text += "\n";
+    }
+    text += "=== 最近对话 ===\n";
+    history.forEach(function(m) {
+      text += (m.role === "user" ? "【我】" : "【Claude】") + " " + m.content + "\n\n";
+    });
+    const buf = Buffer.from(text, "utf-8");
+    const date = new Date().toISOString().slice(0,10);
+    await withRetry(function() {
+      return ctx.replyWithDocument({ source: buf, filename: "chat_export_" + date + ".txt" }, { caption: "📤 对话记录已导出" });
+    });
+  } catch(e) { await ctx.reply("导出失败: " + e.message); }
+});
+
+// /price - 加密货币价格
+bot.command("price", async function(ctx) {
+  const input = ctx.message.text.split(" ").slice(1).join(" ").trim().toLowerCase() || "btc";
+
+  // Symbol → CoinGecko ID mapping
+  const symbolMap = {
+    "btc": "bitcoin", "eth": "ethereum", "sol": "solana", "bnb": "binancecoin",
+    "usdt": "tether", "usdc": "usd-coin", "xrp": "ripple", "ada": "cardano",
+    "avax": "avalanche-2", "doge": "dogecoin", "dot": "polkadot", "matic": "matic-network",
+    "link": "chainlink", "uni": "uniswap", "atom": "cosmos", "ltc": "litecoin",
+    "etc": "ethereum-classic", "xlm": "stellar", "near": "near", "apt": "aptos",
+    "sui": "sui", "op": "optimism", "arb": "arbitrum", "inj": "injective-protocol",
+    "sei": "sei-network", "tia": "celestia", "jup": "jupiter-exchange-solana",
+    "wif": "dogwifcoin", "bonk": "bonk", "pyth": "pyth-network", "jto": "jito-governance-token",
+    "ray": "raydium", "drift": "drift-protocol", "hype": "hyperliquid",
+    "ton": "the-open-network", "trx": "tron", "shib": "shiba-inu", "pepe": "pepe"
+  };
+
+  const coinId = symbolMap[input] || input;
+  await ctx.sendChatAction("typing");
+  try {
+    const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=" + coinId + "&vs_currencies=usd&include_24hr_change=true&include_market_cap=true");
+    const data = await res.json();
+    if (!data[coinId] || Object.keys(data[coinId]).length === 0) {
+      // Try search
+      const searchRes = await fetch("https://api.coingecko.com/api/v3/search?query=" + input);
+      const searchData = await searchRes.json();
+      const found = searchData.coins && searchData.coins[0];
+      if (found) {
+        // Auto-retry with found ID
+        const retryRes = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=" + found.id + "&vs_currencies=usd&include_24hr_change=true&include_market_cap=true");
+        const retryData = await retryRes.json();
+        if (retryData[found.id]) {
+          const p = retryData[found.id];
+          const change = (p.usd_24h_change || 0).toFixed(2);
+          const arrow = parseFloat(change) > 0 ? "📈" : "📉";
+          const mcap = p.usd_market_cap ? " | 市值: $" + (p.usd_market_cap / 1e9).toFixed(2) + "B" : "";
+          return ctx.reply(arrow + " **" + found.symbol.toUpperCase() + "** (" + found.name + ")\n💵 $" + p.usd.toLocaleString() + "\n24h: " + change + "%" + mcap);
+        }
+      }
+      return ctx.reply("找不到 " + input.toUpperCase() + " 的价格。\n\n常用: BTC ETH SOL BNB DOGE AVAX MATIC LINK UNI");
+    }
+    const p = data[coinId];
+    const change = (p.usd_24h_change || 0).toFixed(2);
+    const arrow = parseFloat(change) > 0 ? "📈" : "📉";
+    const mcap = p.usd_market_cap ? " | 市值: $" + (p.usd_market_cap / 1e9).toFixed(2) + "B" : "";
+    const displayName = input.toUpperCase();
+    await ctx.reply(arrow + " **" + displayName + "**\n💵 $" + p.usd.toLocaleString() + "\n24h: " + change + "%" + mcap);
+  } catch(e) { await ctx.reply("价格查询失败: " + e.message); }
+});
+
+// /remind - 设置提醒
+const reminders = new Map();
+bot.command("remind", async function(ctx) {
+  const args = ctx.message.text.split(" ").slice(1);
+  if (args.length < 2) return ctx.reply("用法: /remind 30m 提醒内容\n时间格式: 30m / 2h / 1d");
+  const timeStr = args[0];
+  const content = args.slice(1).join(" ");
+  let ms = 0;
+  if (timeStr.endsWith("m")) ms = parseInt(timeStr) * 60 * 1000;
+  else if (timeStr.endsWith("h")) ms = parseInt(timeStr) * 60 * 60 * 1000;
+  else if (timeStr.endsWith("d")) ms = parseInt(timeStr) * 24 * 60 * 60 * 1000;
+  else return ctx.reply("时间格式错误。例子: 30m、2h、1d");
+  if (!ms || ms > 7 * 24 * 60 * 60 * 1000) return ctx.reply("时间范围: 1分钟 - 7天");
+  const userId = ctx.from.id;
+  setTimeout(async function() {
+    try {
+      await ctx.telegram.sendMessage(userId, "⏰ **提醒！**\n\n" + content);
+    } catch(e) {}
+  }, ms);
+  const timeDisplay = timeStr.endsWith("m") ? timeStr.replace("m","") + " 分钟" : timeStr.endsWith("h") ? timeStr.replace("h","") + " 小时" : timeStr.replace("d","") + " 天";
+  await ctx.reply("✅ 提醒已设置！将在 " + timeDisplay + " 后提醒你:\n" + content + "\n\n⚠️ 注意：重启 Bot 会取消提醒");
+});
+
+// /template - 保存/使用模板
+const userTemplates = new Map();
+bot.command("template", async function(ctx) {
+  const userId = ctx.from.id;
+  const args = ctx.message.text.split(" ").slice(1);
+  const subCmd = args[0];
+
+  if (subCmd === "save") {
+    const name = args[1];
+    const tmpl = args.slice(2).join(" ");
+    if (!name || !tmpl) return ctx.reply("用法: /template save 名称 模板内容\n例如: /template save intro 我是王大神，帮我写...");
+    if (!userTemplates.has(userId)) userTemplates.set(userId, {});
+    userTemplates.get(userId)[name] = tmpl;
+    return ctx.reply("✅ 模板 [" + name + "] 已保存");
+  }
+  if (subCmd === "use") {
+    const name = args[1];
+    const extra = args.slice(2).join(" ");
+    const tmpls = userTemplates.get(userId) || {};
+    if (!tmpls[name]) return ctx.reply("找不到模板 [" + name + "]。用 /template list 查看所有模板");
+    const prompt = tmpls[name] + (extra ? " " + extra : "");
+    await ctx.sendChatAction("typing");
+    const result = await askClaude(userId, prompt, ctx);
+    if (result && !streamedReplies.has(result)) await sendLongMessage(ctx, result);
+    if (result) streamedReplies.delete(result);
+    return;
+  }
+  if (subCmd === "list" || !subCmd) {
+    const tmpls = userTemplates.get(userId) || {};
+    const names = Object.keys(tmpls);
+    if (names.length === 0) return ctx.reply("还没有保存模板。\n用法: /template save 名称 模板内容");
+    return ctx.reply("📋 **你的模板**:\n" + names.map(function(n) { return "- " + n + ": " + tmpls[n].substring(0,50) + "..."; }).join("\n"));
+  }
+  if (subCmd === "delete") {
+    const name = args[1];
+    const tmpls = userTemplates.get(userId) || {};
+    delete tmpls[name];
+    return ctx.reply("🗑 模板 [" + name + "] 已删除");
+  }
+  await ctx.reply("用法:\n/template save 名称 内容\n/template use 名称 [额外内容]\n/template list\n/template delete 名称");
+});
+
+// /help - 帮助
+bot.command("help", async function(ctx) {
+  const helpText = "🤖 **Claude 大神 — 完整命令列表**\n\n" +
+    "**💬 对话工具**\n" +
+    "/translate [语言] [文字] — 翻译\n" +
+    "/improve [文字] — 润色改写\n" +
+    "/brainstorm [话题] — 头脑风暴分析\n" +
+    "/summarize — 压缩对话历史\n\n" +
+    "**💰 加密/赏金**\n" +
+    "/price [币名] — 实时价格 (BTC/ETH/SOL)\n" +
+    "/vibe — 建项目推 GitHub\n" +
+    "/deploy [GitHub链接] — 部署到 Railway\n" +
+    "/pipeline — 手动触发赏金扫描\n" +
+    "/pipelinestatus — Pipeline 状态\n\n" +
+    "**💻 代码工具**\n" +
+    "/fix — 修改代码文件\n" +
+    "/explain — 解释代码逻辑\n" +
+    "/review — 代码审查评分\n" +
+    "/test — 生成测试用例\n" +
+    "/save [版本名] — 保存代码版本\n" +
+    "/versions — 查看所有版本\n" +
+    "/load [版本名] — 加载版本\n\n" +
+    "**🎨 创作**\n" +
+    "/imagine [描述] — AI 图片生成\n" +
+    "/weekly — 本周活动总结\n\n" +
+    "**🧠 记忆**\n" +
+    "/memory — 完整记忆总览\n" +
+    "/soul — 查看个人档案\n" +
+    "/notes — 查看笔记\n" +
+    "/note [内容] — 添加笔记\n\n" +
+    "**⚙️ 工具**\n" +
+    "/remind [时间] [内容] — 设置提醒 (30m/2h/1d)\n" +
+    "/template save/use/list — 管理 Prompt 模板\n" +
+    "/export — 导出聊天记录\n" +
+    "/stats — Token 使用统计\n" +
+    "/forget — 清除对话历史\n" +
+    "/reset — 重置所有内容\n\n" +
+    "**📎 文件支持**\n" +
+    "PDF、ZIP、DOCX、XLSX、图片、代码文件、txt、csv、json";
+  await sendLongMessage(ctx, helpText);
+});
+
+// URL 自动摘要（非赏金链接，普通对话中发链接）
+async function summarizeUrl(ctx, url) {
+  try {
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(10000) });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").substring(0, 5000);
+    if (text.length < 100) return null;
+    const sumRes = await anthropic.messages.create({
+      model: FAST_MODEL, max_tokens: 500,
+      messages: [{ role: "user", content: "用3-5句话总结这个页面内容，用中文：\n\n" + text }]
+    });
+    return (sumRes.content[0] || {}).text || null;
+  } catch(e) { return null; }
+}
+
+// 每日简报 (凌晨7点 +8 = UTC 23:00)
+function scheduleDailyBriefing() {
+  const now = new Date();
+  const target = new Date();
+  target.setUTCHours(23, 0, 0, 0);
+  if (target <= now) target.setUTCDate(target.getUTCDate() + 1);
+  const delay = target - now;
+  setTimeout(async function() {
+    try {
+      const priceRes = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true");
+      const prices = await priceRes.json();
+      const fmt = function(id, symbol) {
+        const p = prices[id];
+        if (!p) return "";
+        const c = (p.usd_24h_change || 0).toFixed(1);
+        return symbol + ": $" + p.usd.toLocaleString() + " (" + (c > 0 ? "+" : "") + c + "%)";
+      };
+      const msg = "☀️ **每日简报**\n\n**市场价格**\n" +
+        fmt("bitcoin", "BTC") + "\n" +
+        fmt("ethereum", "ETH") + "\n" +
+        fmt("solana", "SOL") + "\n\n" +
+        "**赏金 Pipeline 运行时间**: 凌晨 1-6 点\n" +
+        "今天也要加油！💪";
+      if (PIPELINE_OWNER) {
+        await bot.telegram.sendMessage(PIPELINE_OWNER, msg).catch(function(){});
+      }
+    } catch(e) { console.log("Daily briefing error:", e.message); }
+    scheduleDailyBriefing(); // reschedule next day
+  }, delay);
+  console.log("Daily briefing scheduled in", Math.round(delay/1000/60), "minutes");
+}
+
+
 // ── 处理文字消息 ──────────────────────────────────────────────────────────────
 
 bot.command("deploy", async function(ctx) {
@@ -1526,6 +1855,82 @@ bot.command("imagine", async function(ctx) {
     }
   });
 });
+
+bot.command("stats", async function(ctx) {
+  const userId = ctx.from.id;
+  let usage = tokenUsage.get(userId) || { input: 0, output: 0, calls: 0 };
+  // Load from Supabase for persistent totals
+  if (supabase) {
+    try {
+      const { data } = await supabase.from("conversations")
+        .select("content").eq("user_id", parseInt(userId)).eq("role", "stats")
+        .order("created_at", { ascending: false }).limit(500);
+      if (data && data.length > 0) {
+        const totals = data.reduce(function(acc, row) {
+          try {
+            const d = JSON.parse(row.content);
+            acc.input += d.input || 0;
+            acc.output += d.output || 0;
+            acc.calls += 1;
+          } catch(e) {}
+          return acc;
+        }, { input: 0, output: 0, calls: 0 });
+        usage = totals;
+      }
+    } catch(e) {}
+  }
+  const cost = estimateCost(usage.input, usage.output);
+  const avgInput = usage.calls > 0 ? Math.round(usage.input / usage.calls) : 0;
+  const avgOutput = usage.calls > 0 ? Math.round(usage.output / usage.calls) : 0;
+
+  await ctx.reply(
+    "📊 Token 使用统计（本次运行）\n\n" +
+    "💬 对话次数：" + usage.calls + " 次\n" +
+    "📥 输入 tokens：" + usage.input.toLocaleString() + "\n" +
+    "📤 输出 tokens：" + usage.output.toLocaleString() + "\n" +
+    "💰 估算费用：$" + cost + "\n\n" +
+    "📈 平均每次\n" +
+    "  输入：" + avgInput + " tokens\n" +
+    "  输出：" + avgOutput + " tokens\n\n" +
+    (autoOptimize(userId) ? "⚠️ 自动建议\n• " + autoOptimize(userId).join("\n• ") + "\n\n" : "") +
+    "💡 省钱建议\n" +
+    "• 保持 soul/projects 精简\n" +
+    "• 用 /fix 而非重新生成\n" +
+    "• 定期 /forget 清历史"
+  );
+});
+
+bot.command("pipeline", async function(ctx) {
+  const userId = ctx.from.id;
+  if (!PIPELINE_ENABLED) {
+    return ctx.reply("Pipeline 未启用。在 Railway Variables 添加：\nPIPELINE_ENABLED=true\nPIPELINE_OWNER_ID=" + userId);
+  }
+  await ctx.reply("🤖 手动触发 Pipeline 扫描...");
+  runBountyPipeline(bot);
+});
+
+bot.command("pipelinestatus", async function(ctx) {
+  const userId = ctx.from.id;
+  await ctx.reply(
+    "Pipeline 状态:\n" +
+    "启用: " + (PIPELINE_ENABLED ? "✅" : "❌") + "\n" +
+    "你的 ID: " + userId + "\n" +
+    "Owner ID: " + (PIPELINE_OWNER || "未设置") + "\n" +
+    "已追踪赏金: " + seenBounties.size + " 个\n\n" +
+    "要启用自动运行，在 Railway Variables 添加:\n" +
+    "PIPELINE_ENABLED=true\n" +
+    "PIPELINE_OWNER_ID=" + userId
+  );
+});
+
+// Start auto pipeline if enabled (every 30 minutes)
+setTimeout(function() {
+  if (PIPELINE_ENABLED && PIPELINE_OWNER) {
+    console.log("Auto pipeline started, running every 30 minutes");
+    runBountyPipeline(bot);
+    setInterval(function() { runBountyPipeline(bot); }, 30 * 60 * 1000);
+  }
+}, 60000); // wait 60s after startup to avoid 429
 
 bot.on("text", async function(ctx) {
   const userId = ctx.from.id;
@@ -1951,7 +2356,8 @@ bot.on("text", async function(ctx) {
       });
       // result is null if 2-pass already sent file, or if streaming handled display
       // Only call sendLongMessage for non-streaming results (fallback path)
-      if (result && !result.__streamedAlready) {
+      if (result && !streamedReplies.has(result)) {
+        streamedReplies.delete(result);
         await sendLongMessage(ctx, result);
       }
     } catch (err) {
@@ -2966,379 +3372,5 @@ async function runBountyPipeline(bot) {
 
 // Manual trigger command
 
-
-// ── 新增功能命令 ──────────────────────────────────────────────────────────────
-
-// /translate - 翻译
-bot.command("translate", async function(ctx) {
-  const args = ctx.message.text.split(" ");
-  const lang = args[1] || "English";
-  const text = args.slice(2).join(" ");
-  if (!text) return ctx.reply("用法: /translate 英文 你想翻译的内容\n例如: /translate 英文 你好世界");
-  await ctx.sendChatAction("typing");
-  try {
-    const res = await anthropic.messages.create({
-      model: FAST_MODEL, max_tokens: 1000,
-      messages: [{ role: "user", content: "翻译成" + lang + "，只输出翻译结果，不要解释:\n\n" + text }]
-    });
-    await ctx.reply("🌐 " + ((res.content[0] || {}).text || ""));
-  } catch(e) { await ctx.reply("翻译失败: " + e.message); }
-});
-
-// /improve - 润色改写
-bot.command("improve", async function(ctx) {
-  const text = ctx.message.text.split(" ").slice(1).join(" ");
-  if (!text) return ctx.reply("用法: /improve 你要润色的文字");
-  await ctx.sendChatAction("typing");
-  try {
-    const res = await anthropic.messages.create({
-      model: MAIN_MODEL, max_tokens: 2000,
-      messages: [{ role: "user", content: "请润色改写以下文字，保持原意但更专业、流畅。同时提供两个版本：简洁版和详细版。\n\n" + text }]
-    });
-    await sendLongMessage(ctx, "✨ **润色结果**\n\n" + ((res.content[0] || {}).text || ""));
-  } catch(e) { await ctx.reply("润色失败: " + e.message); }
-});
-
-// /brainstorm - 头脑风暴
-bot.command("brainstorm", async function(ctx) {
-  const topic = ctx.message.text.split(" ").slice(1).join(" ");
-  if (!topic) return ctx.reply("用法: /brainstorm 你的话题或问题");
-  await ctx.sendChatAction("typing");
-  try {
-    const res = await anthropic.messages.create({
-      model: MAIN_MODEL, max_tokens: 2000,
-      messages: [{ role: "user", content: "对以下话题做结构化头脑风暴分析。用中文输出，格式：\n1. 核心概念分解\n2. 5个创意方向（每个附简短说明）\n3. 潜在风险/挑战\n4. 推荐下一步行动\n\n话题: " + topic }]
-    });
-    await sendLongMessage(ctx, "🧠 **头脑风暴: " + topic + "**\n\n" + ((res.content[0] || {}).text || ""));
-  } catch(e) { await ctx.reply("失败: " + e.message); }
-});
-
-// /explain - 解释代码
-bot.command("explain", async function(ctx) {
-  const code = ctx.message.text.split("\n").slice(1).join("\n") || ctx.message.text.split(" ").slice(1).join(" ");
-  if (!code.trim()) return ctx.reply("用法: 发 /explain 然后换行粘贴代码");
-  await ctx.sendChatAction("typing");
-  try {
-    const res = await anthropic.messages.create({
-      model: MAIN_MODEL, max_tokens: 2000,
-      messages: [{ role: "user", content: "用中文解释以下代码的逻辑和功能，不要修改，只解释：\n\n" + code }]
-    });
-    await sendLongMessage(ctx, "💡 **代码解释**\n\n" + ((res.content[0] || {}).text || ""));
-  } catch(e) { await ctx.reply("失败: " + e.message); }
-});
-
-// /review - 代码审查
-bot.command("review", async function(ctx) {
-  const code = ctx.message.text.split("\n").slice(1).join("\n") || ctx.message.text.split(" ").slice(1).join(" ");
-  if (!code.trim()) return ctx.reply("用法: 发 /review 然后换行粘贴代码");
-  await ctx.sendChatAction("typing");
-  try {
-    const res = await anthropic.messages.create({
-      model: MAIN_MODEL, max_tokens: 2000,
-      messages: [{ role: "user", content: "对以下代码做专业代码审查，用中文输出：\n1. 整体评分（1-10）\n2. 优点\n3. 问题/Bug\n4. 安全隐患\n5. 改进建议\n\n" + code }]
-    });
-    await sendLongMessage(ctx, "🔍 **代码审查**\n\n" + ((res.content[0] || {}).text || ""));
-  } catch(e) { await ctx.reply("失败: " + e.message); }
-});
-
-// /test - 生成测试用例
-bot.command("test", async function(ctx) {
-  const code = ctx.message.text.split("\n").slice(1).join("\n") || ctx.message.text.split(" ").slice(1).join(" ");
-  if (!code.trim()) return ctx.reply("用法: 发 /test 然后换行粘贴代码");
-  await ctx.sendChatAction("typing");
-  try {
-    const res = await anthropic.messages.create({
-      model: MAIN_MODEL, max_tokens: 3000,
-      messages: [{ role: "user", content: "为以下代码生成完整的测试用例（包括正常情况、边界情况、错误情况）。输出可直接运行的测试代码：\n\n" + code }]
-    });
-    const testCode = (res.content[0] || {}).text || "";
-    const buf = Buffer.from(testCode, "utf-8");
-    const ts = new Date().toISOString().slice(11,16).replace(":","");
-    await withRetry(function() {
-      return ctx.replyWithDocument({ source: buf, filename: "test_" + ts + ".js" }, { caption: "✅ 测试用例已生成" });
-    });
-  } catch(e) { await ctx.reply("失败: " + e.message); }
-});
-
-// /export - 导出聊天记录
-bot.command("export", async function(ctx) {
-  const userId = ctx.from.id;
-  await ctx.sendChatAction("upload_document");
-  try {
-    const history = await getHistory(userId);
-    const summaries = await getSummaries(userId);
-    let text = "=== Claude 大神 对话记录 ===\n";
-    text += "导出时间: " + new Date().toLocaleString("zh-CN") + "\n\n";
-    if (summaries.length > 0) {
-      text += "=== 对话摘要 ===\n";
-      summaries.forEach(function(s) { text += "- " + s.content + "\n"; });
-      text += "\n";
-    }
-    text += "=== 最近对话 ===\n";
-    history.forEach(function(m) {
-      text += (m.role === "user" ? "【我】" : "【Claude】") + " " + m.content + "\n\n";
-    });
-    const buf = Buffer.from(text, "utf-8");
-    const date = new Date().toISOString().slice(0,10);
-    await withRetry(function() {
-      return ctx.replyWithDocument({ source: buf, filename: "chat_export_" + date + ".txt" }, { caption: "📤 对话记录已导出" });
-    });
-  } catch(e) { await ctx.reply("导出失败: " + e.message); }
-});
-
-// /price - 加密货币价格
-bot.command("price", async function(ctx) {
-  const coin = ctx.message.text.split(" ").slice(1).join(" ").trim().toLowerCase() || "bitcoin";
-  await ctx.sendChatAction("typing");
-  try {
-    const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=" + coin + "&vs_currencies=usd,btc&include_24hr_change=true&include_market_cap=true");
-    const data = await res.json();
-    if (!data[coin]) {
-      // Try search by symbol
-      const searchRes = await fetch("https://api.coingecko.com/api/v3/search?query=" + coin);
-      const searchData = await searchRes.json();
-      const found = searchData.coins && searchData.coins[0];
-      if (found) return ctx.reply("找不到 " + coin + "，你是指: " + found.name + " (" + found.symbol + ")？\n\n用 /price " + found.id + " 查询");
-      return ctx.reply("找不到 " + coin + " 的价格数据");
-    }
-    const p = data[coin];
-    const change = (p.usd_24h_change || 0).toFixed(2);
-    const arrow = change > 0 ? "📈" : "📉";
-    const mcap = p.usd_market_cap ? " | 市值: $" + (p.usd_market_cap / 1e9).toFixed(2) + "B" : "";
-    await ctx.reply(arrow + " **" + coin.toUpperCase() + "**\n💵 $" + p.usd.toLocaleString() + "\n24h: " + change + "%" + mcap);
-  } catch(e) { await ctx.reply("价格查询失败: " + e.message); }
-});
-
-// /remind - 设置提醒
-const reminders = new Map();
-bot.command("remind", async function(ctx) {
-  const args = ctx.message.text.split(" ").slice(1);
-  if (args.length < 2) return ctx.reply("用法: /remind 30m 提醒内容\n时间格式: 30m / 2h / 1d");
-  const timeStr = args[0];
-  const content = args.slice(1).join(" ");
-  let ms = 0;
-  if (timeStr.endsWith("m")) ms = parseInt(timeStr) * 60 * 1000;
-  else if (timeStr.endsWith("h")) ms = parseInt(timeStr) * 60 * 60 * 1000;
-  else if (timeStr.endsWith("d")) ms = parseInt(timeStr) * 24 * 60 * 60 * 1000;
-  else return ctx.reply("时间格式错误。例子: 30m、2h、1d");
-  if (!ms || ms > 7 * 24 * 60 * 60 * 1000) return ctx.reply("时间范围: 1分钟 - 7天");
-  const userId = ctx.from.id;
-  setTimeout(async function() {
-    try {
-      await ctx.telegram.sendMessage(userId, "⏰ **提醒！**\n\n" + content);
-    } catch(e) {}
-  }, ms);
-  const timeDisplay = timeStr.endsWith("m") ? timeStr.replace("m","") + " 分钟" : timeStr.endsWith("h") ? timeStr.replace("h","") + " 小时" : timeStr.replace("d","") + " 天";
-  await ctx.reply("✅ 提醒已设置！将在 " + timeDisplay + " 后提醒你:\n" + content);
-});
-
-// /template - 保存/使用模板
-const userTemplates = new Map();
-bot.command("template", async function(ctx) {
-  const userId = ctx.from.id;
-  const args = ctx.message.text.split(" ").slice(1);
-  const subCmd = args[0];
-
-  if (subCmd === "save") {
-    const name = args[1];
-    const tmpl = args.slice(2).join(" ");
-    if (!name || !tmpl) return ctx.reply("用法: /template save 名称 模板内容\n例如: /template save intro 我是王大神，帮我写...");
-    if (!userTemplates.has(userId)) userTemplates.set(userId, {});
-    userTemplates.get(userId)[name] = tmpl;
-    return ctx.reply("✅ 模板 [" + name + "] 已保存");
-  }
-  if (subCmd === "use") {
-    const name = args[1];
-    const extra = args.slice(2).join(" ");
-    const tmpls = userTemplates.get(userId) || {};
-    if (!tmpls[name]) return ctx.reply("找不到模板 [" + name + "]。用 /template list 查看所有模板");
-    const prompt = tmpls[name] + (extra ? " " + extra : "");
-    await ctx.sendChatAction("typing");
-    const result = await askClaude(userId, prompt, ctx);
-    if (result && !result.__streamedAlready) await sendLongMessage(ctx, result);
-    return;
-  }
-  if (subCmd === "list" || !subCmd) {
-    const tmpls = userTemplates.get(userId) || {};
-    const names = Object.keys(tmpls);
-    if (names.length === 0) return ctx.reply("还没有保存模板。\n用法: /template save 名称 模板内容");
-    return ctx.reply("📋 **你的模板**:\n" + names.map(function(n) { return "- " + n + ": " + tmpls[n].substring(0,50) + "..."; }).join("\n"));
-  }
-  if (subCmd === "delete") {
-    const name = args[1];
-    const tmpls = userTemplates.get(userId) || {};
-    delete tmpls[name];
-    return ctx.reply("🗑 模板 [" + name + "] 已删除");
-  }
-  await ctx.reply("用法:\n/template save 名称 内容\n/template use 名称 [额外内容]\n/template list\n/template delete 名称");
-});
-
-// /help - 帮助
-bot.command("help", async function(ctx) {
-  const helpText = "🤖 **Claude 大神 — 完整命令列表**\n\n" +
-    "**💬 对话工具**\n" +
-    "/translate [语言] [文字] — 翻译\n" +
-    "/improve [文字] — 润色改写\n" +
-    "/brainstorm [话题] — 头脑风暴分析\n" +
-    "/summarize — 压缩对话历史\n\n" +
-    "**💰 加密/赏金**\n" +
-    "/price [币名] — 实时价格 (BTC/ETH/SOL)\n" +
-    "/vibe — 建项目推 GitHub\n" +
-    "/deploy [GitHub链接] — 部署到 Railway\n" +
-    "/pipeline — 手动触发赏金扫描\n" +
-    "/pipelinestatus — Pipeline 状态\n\n" +
-    "**💻 代码工具**\n" +
-    "/fix — 修改代码文件\n" +
-    "/explain — 解释代码逻辑\n" +
-    "/review — 代码审查评分\n" +
-    "/test — 生成测试用例\n" +
-    "/save [版本名] — 保存代码版本\n" +
-    "/versions — 查看所有版本\n" +
-    "/load [版本名] — 加载版本\n\n" +
-    "**🎨 创作**\n" +
-    "/imagine [描述] — AI 图片生成\n" +
-    "/weekly — 本周活动总结\n\n" +
-    "**🧠 记忆**\n" +
-    "/memory — 完整记忆总览\n" +
-    "/soul — 查看个人档案\n" +
-    "/notes — 查看笔记\n" +
-    "/note [内容] — 添加笔记\n\n" +
-    "**⚙️ 工具**\n" +
-    "/remind [时间] [内容] — 设置提醒 (30m/2h/1d)\n" +
-    "/template save/use/list — 管理 Prompt 模板\n" +
-    "/export — 导出聊天记录\n" +
-    "/stats — Token 使用统计\n" +
-    "/forget — 清除对话历史\n" +
-    "/reset — 重置所有内容\n\n" +
-    "**📎 文件支持**\n" +
-    "PDF、ZIP、DOCX、XLSX、图片、代码文件、txt、csv、json";
-  await sendLongMessage(ctx, helpText);
-});
-
-// URL 自动摘要（非赏金链接，普通对话中发链接）
-async function summarizeUrl(ctx, url) {
-  try {
-    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(10000) });
-    if (!res.ok) return null;
-    const html = await res.text();
-    const text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-      .replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").substring(0, 5000);
-    if (text.length < 100) return null;
-    const sumRes = await anthropic.messages.create({
-      model: FAST_MODEL, max_tokens: 500,
-      messages: [{ role: "user", content: "用3-5句话总结这个页面内容，用中文：\n\n" + text }]
-    });
-    return (sumRes.content[0] || {}).text || null;
-  } catch(e) { return null; }
-}
-
-// 每日简报 (凌晨7点 +8 = UTC 23:00)
-function scheduleDailyBriefing() {
-  const now = new Date();
-  const target = new Date();
-  target.setUTCHours(23, 0, 0, 0);
-  if (target <= now) target.setUTCDate(target.getUTCDate() + 1);
-  const delay = target - now;
-  setTimeout(async function() {
-    try {
-      const priceRes = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true");
-      const prices = await priceRes.json();
-      const fmt = function(id, symbol) {
-        const p = prices[id];
-        if (!p) return "";
-        const c = (p.usd_24h_change || 0).toFixed(1);
-        return symbol + ": $" + p.usd.toLocaleString() + " (" + (c > 0 ? "+" : "") + c + "%)";
-      };
-      const msg = "☀️ **每日简报**\n\n**市场价格**\n" +
-        fmt("bitcoin", "BTC") + "\n" +
-        fmt("ethereum", "ETH") + "\n" +
-        fmt("solana", "SOL") + "\n\n" +
-        "**赏金 Pipeline 运行时间**: 凌晨 1-6 点\n" +
-        "今天也要加油！💪";
-      if (PIPELINE_OWNER) {
-        await bot.telegram.sendMessage(PIPELINE_OWNER, msg).catch(function(){});
-      }
-    } catch(e) { console.log("Daily briefing error:", e.message); }
-    scheduleDailyBriefing(); // reschedule next day
-  }, delay);
-  console.log("Daily briefing scheduled in", Math.round(delay/1000/60), "minutes");
-}
-
-bot.command("stats", async function(ctx) {
-  const userId = ctx.from.id;
-  let usage = tokenUsage.get(userId) || { input: 0, output: 0, calls: 0 };
-  // Load from Supabase for persistent totals
-  if (supabase) {
-    try {
-      const { data } = await supabase.from("conversations")
-        .select("content").eq("user_id", parseInt(userId)).eq("role", "stats")
-        .order("created_at", { ascending: false }).limit(500);
-      if (data && data.length > 0) {
-        const totals = data.reduce(function(acc, row) {
-          try {
-            const d = JSON.parse(row.content);
-            acc.input += d.input || 0;
-            acc.output += d.output || 0;
-            acc.calls += 1;
-          } catch(e) {}
-          return acc;
-        }, { input: 0, output: 0, calls: 0 });
-        usage = totals;
-      }
-    } catch(e) {}
-  }
-  const cost = estimateCost(usage.input, usage.output);
-  const avgInput = usage.calls > 0 ? Math.round(usage.input / usage.calls) : 0;
-  const avgOutput = usage.calls > 0 ? Math.round(usage.output / usage.calls) : 0;
-
-  await ctx.reply(
-    "📊 Token 使用统计（本次运行）\n\n" +
-    "💬 对话次数：" + usage.calls + " 次\n" +
-    "📥 输入 tokens：" + usage.input.toLocaleString() + "\n" +
-    "📤 输出 tokens：" + usage.output.toLocaleString() + "\n" +
-    "💰 估算费用：$" + cost + "\n\n" +
-    "📈 平均每次\n" +
-    "  输入：" + avgInput + " tokens\n" +
-    "  输出：" + avgOutput + " tokens\n\n" +
-    (autoOptimize(userId) ? "⚠️ 自动建议\n• " + autoOptimize(userId).join("\n• ") + "\n\n" : "") +
-    "💡 省钱建议\n" +
-    "• 保持 soul/projects 精简\n" +
-    "• 用 /fix 而非重新生成\n" +
-    "• 定期 /forget 清历史"
-  );
-});
-
-bot.command("pipeline", async function(ctx) {
-  const userId = ctx.from.id;
-  if (!PIPELINE_ENABLED) {
-    return ctx.reply("Pipeline 未启用。在 Railway Variables 添加：\nPIPELINE_ENABLED=true\nPIPELINE_OWNER_ID=" + userId);
-  }
-  await ctx.reply("🤖 手动触发 Pipeline 扫描...");
-  runBountyPipeline(bot);
-});
-
-bot.command("pipelinestatus", async function(ctx) {
-  const userId = ctx.from.id;
-  await ctx.reply(
-    "Pipeline 状态:\n" +
-    "启用: " + (PIPELINE_ENABLED ? "✅" : "❌") + "\n" +
-    "你的 ID: " + userId + "\n" +
-    "Owner ID: " + (PIPELINE_OWNER || "未设置") + "\n" +
-    "已追踪赏金: " + seenBounties.size + " 个\n\n" +
-    "要启用自动运行，在 Railway Variables 添加:\n" +
-    "PIPELINE_ENABLED=true\n" +
-    "PIPELINE_OWNER_ID=" + userId
-  );
-});
-
-// Start auto pipeline if enabled (every 30 minutes)
-setTimeout(function() {
-  if (PIPELINE_ENABLED && PIPELINE_OWNER) {
-    console.log("Auto pipeline started, running every 30 minutes");
-    runBountyPipeline(bot);
-    setInterval(function() { runBountyPipeline(bot); }, 30 * 60 * 1000);
-  }
-}, 60000); // wait 60s after startup to avoid 429
 
 launch().catch(console.error);
